@@ -22,12 +22,23 @@ ROOT_DIR:=$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 # hw platform as from autogen.sh choose
 HWPLAT:=$(shell cat $(ROOT_DIR)/hwplatform)
 
-# sets CCFLAGS hw platform dependant
+# Detect host architecture
+ARCH := $(shell uname -m)
+
+# Set CCFLAGS depending on hardware platform / architecture
 ifeq ($(HWPLAT),BananaPI)
-	CCFLAGS=-Wall -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7 -mtune=cortex-a7 -DBANANAPI
-else # fallback to raspberry
-	# The recommended compiler flags for the Raspberry Pi
-	CCFLAGS=-Ofast -mfpu=vfp -mfloat-abi=hard -march=armv6zk -mtune=arm1176jzf-s
+    CCFLAGS = -Wall -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7 -mtune=cortex-a7 -DBANANAPI
+else
+    ifeq ($(ARCH),armv7l)   # 32-bit ARMv7 (e.g. Raspberry Pi 2)
+        CCFLAGS = -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7-a -mtune=cortex-a7
+    else ifeq ($(ARCH),armv6l)  # 32-bit ARMv6 (Raspberry Pi 1/Zero)
+        CCFLAGS = -Ofast -mfpu=vfp -mfloat-abi=hard -march=armv6zk -mtune=arm1176jzf-s
+    else ifeq ($(ARCH),aarch64) # 64-bit ARM (Raspberry Pi 3/4/5, ARM servers)
+        CCFLAGS = -Ofast -march=armv8-a -mtune=cortex-a53
+    else
+        $(warning Unknown architecture $(ARCH), using generic flags)
+        CCFLAGS = -Ofast
+    endif
 endif
 
 # Where you want it installed when you do 'make install'
