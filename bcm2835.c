@@ -15,11 +15,13 @@
 //              Done a hack to use CE1 by software as custom CS pin because HW does not work
 //              Added function to determine PI revision board
 //							Added function to set SPI speed (instead of divider for easier look in code)
-// 06/29/2013   Incorporated latest version of bcm2825.h done by Mike McCauley
+// 06/29/2013 : Incorporated latest version of bcm2825.h done by Mike McCauley
 // 
-// 08/26/2015	Lorenzo Delana (lorenzo.delana@gmail.com)
-//		Use of i2c-2 if BANANAPI macro enabled
-
+// 08/26/2015 : Lorenzo Delana (lorenzo.delana@gmail.com)
+//				Use of i2c-2 if BANANAPI macro enabled
+//
+// 31/08/2025 : Andy Taylor (MW0MWZ)
+//				Fix up C99 compiler bleating
 
 #include <stdio.h>
 #include <stdlib.h>
