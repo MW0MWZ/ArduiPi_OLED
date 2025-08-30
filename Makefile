@@ -14,57 +14,92 @@
 # 08/26/2015	Lorenzo Delana (lorenzo.delana@gmail.com)
 #							added bananapi specific CCFLAGS and conditional macro BANANPI
 #
+# 31-Aug-2025	Andy Taylor (MW0MWZ)
+#							Updated Makefile to work with aarch64 / armv7 / armhf
+#							Re-worked to work on Alpine Linux / Musl
+#
 # *********************************************************************
 
-# Makefile itself dir
-ROOT_DIR:=$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
+#*********************************************************************
+# ArduiPi OLED library driver — portable Makefile (RasPiOS & Alpine)
+#*********************************************************************
 
-# hw platform as from autogen.sh choose
-HWPLAT:=$(shell cat $(ROOT_DIR)/hwplatform)
+# --- Makefile location & platform metadata --------------------------
+ROOT_DIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
+HWPLAT   := $(shell cat $(ROOT_DIR)/hwplatform 2>/dev/null || echo "")
+ARCH     := $(shell uname -m)
 
-# Detect host architecture
-ARCH := $(shell uname -m)
+# Detect Alpine and musl
+IS_ALPINE := $(shell [ -f /etc/alpine-release ] && echo yes || echo no)
+IS_MUSL   := $(shell ldd --version 2>&1 | grep -iq musl && echo yes || echo no)
 
-# Set CCFLAGS depending on hardware platform / architecture
-ifeq ($(HWPLAT),BananaPI)
-    CCFLAGS = -Wall -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7 -mtune=cortex-a7 -DBANANAPI
-else
-    ifeq ($(ARCH),armv7l)   # 32-bit ARMv7 (e.g. Raspberry Pi 2)
-        CCFLAGS = -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7-a -mtune=cortex-a7
-    else ifeq ($(ARCH),armv6l)  # 32-bit ARMv6 (Raspberry Pi 1/Zero)
-        CCFLAGS = -Ofast -mfpu=vfp -mfloat-abi=hard -march=armv6zk -mtune=arm1176jzf-s
-    else ifeq ($(ARCH),aarch64) # 64-bit ARM (Raspberry Pi 3/4/5, ARM servers)
-        CCFLAGS = -Ofast -march=armv8-a -mtune=cortex-a53
-    else
-        $(warning Unknown architecture $(ARCH), using generic flags)
-        CCFLAGS = -Ofast
-    endif
+# --- Install prefix defaults ----------------------------------------
+# On Alpine/musl, install under /usr so the dynamic loader finds libs without rpath.
+ifndef PREFIX
+  ifeq ($(IS_ALPINE),yes)
+    PREFIX := /usr
+  else
+    PREFIX := /usr/local
+  endif
 endif
 
-# Where you want it installed when you do 'make install'
-PREFIX=/usr/local
+# --- Library parameters ---------------------------------------------
+LIBDIR  := $(PREFIX)/lib
+LIB     := libArduiPi_OLED
+LIBNAME := $(LIB).so.1.0
 
-# Library parameters
-# where to put the lib
-LIBDIR=$(PREFIX)/lib
-# lib name 
-LIB=libArduiPi_OLED
-# shared library name
-LIBNAME=$(LIB).so.1.0
+# Compilers
+CXX := g++
+CC  := gcc
 
-CXX=g++
-CC=gcc
-CFLAGS=$(CCFLAGS)
+# --- Architecture-tuned CFLAGS --------------------------------------
+# Set CCFLAGS depending on hardware platform / architecture
+ifeq ($(HWPLAT),BananaPI)
+  CCFLAGS = -Wall -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7 -mtune=cortex-a7 -DBANANAPI
+else
+  ifeq ($(ARCH),armv7l)        # 32-bit ARMv7 (e.g. Raspberry Pi 2)
+    CCFLAGS = -Ofast -mfpu=vfpv4 -mfloat-abi=hard -march=armv7-a -mtune=cortex-a7
+  else ifeq ($(ARCH),armv6l)   # 32-bit ARMv6 (Pi 1/Zero)
+    CCFLAGS = -Ofast -mfpu=vfp -mfloat-abi=hard -march=armv6zk -mtune=arm1176jzf-s
+  else ifeq ($(ARCH),aarch64)  # 64-bit ARM (Pi 3/4/5, ARM servers)
+    CCFLAGS = -Ofast -march=armv8-a -mtune=cortex-a53
+  else
+    $(warning Unknown architecture $(ARCH), using generic -Ofast flags)
+    CCFLAGS = -Ofast
+  endif
+endif
 
-# make all
-# reinstall the library after each recompilation
+# --- I2C detection (prefer pkg-config, fallback to -li2c) -----------
+PKGCONFIG ?= pkg-config
+HAVE_I2C_PC := $(shell $(PKGCONFIG) --exists i2c && echo yes || echo no)
+ifeq ($(HAVE_I2C_PC),yes)
+  I2C_CFLAGS  := $(shell $(PKGCONFIG) --cflags i2c)
+  I2C_LDFLAGS := $(shell $(PKGCONFIG) --libs   i2c)
+else
+  I2C_CFLAGS  :=
+  I2C_LDFLAGS := -li2c
+endif
+
+# Final flags
+CFLAGS  := $(CCFLAGS) $(I2C_CFLAGS)
+LDFLAGS := $(LDFLAGS) $(I2C_LDFLAGS)
+
+# If using musl and installing to a non-standard loader path, inject rpath automatically
+ifeq ($(IS_MUSL),yes)
+  ifneq ($(PREFIX),/usr)
+    LDFLAGS += -Wl,-rpath,$(LIBDIR)
+  endif
+endif
+
+# --- Build targets ---------------------------------------------------
+# Reinstall the library after each recompilation
 all: ArduiPi_OLED install
 
-# Make the library
+# Shared library link
 ArduiPi_OLED: ArduiPi_OLED.o Adafruit_GFX.o bcm2835.o Wrapper.o
-	$(CXX) -shared -Wl,-soname,$(LIB).so.1 $(CFLAGS) $(LDFLAGS)  -o ${LIBNAME} $^ -li2c
+	$(CXX) -shared -Wl,-soname,$(LIB).so.1 $(CFLAGS) $(LDFLAGS) -o $(LIBNAME) $^
 
-# Library parts (use -fno-rtti flag to avoid link problem)
+# Objects (use -fno-rtti to avoid link issues some setups have)
 ArduiPi_OLED.o: ArduiPi_OLED.cpp
 	$(CXX) -Wall -fPIC -fno-rtti $(CFLAGS) -c $^
 
@@ -72,39 +107,37 @@ Adafruit_GFX.o: Adafruit_GFX.cpp
 	$(CXX) -Wall -fPIC -fno-rtti $(CFLAGS) -c $^
 
 bcm2835.o: bcm2835.c
-	$(CC) -Wall -fPIC $(CFLAGS) -c $^
+	$(CC)  -Wall -fPIC $(CFLAGS) -c $^
 
 Wrapper.o: Wrapper.cpp
-	$(CC) -Wall -fPIC $(CFLAGS) -c $^
+	$(CXX) -Wall -fPIC $(CFLAGS) -c $^
 
-# Install the library to LIBPATH
-install: 
+# --- Install ---------------------------------------------------------
+install:
 	@echo "[Install Library]"
-	@if ( test ! -d $(PREFIX)/lib ) ; then mkdir -p $(PREFIX)/lib ; fi
-	@install -m 0755 ${LIBNAME} ${LIBDIR}
-	@ln -sf ${LIBDIR}/${LIBNAME} ${LIBDIR}/${LIB}.so.1
-	@ln -sf ${LIBDIR}/${LIBNAME} ${LIBDIR}/${LIB}.so
-	@ldconfig
-	@rm -rf ${LIB}.*
+	@mkdir -p $(LIBDIR)
+	@install -m 0755 $(LIBNAME) $(LIBDIR)
+	@ln -sf $(LIBDIR)/$(LIBNAME) $(LIBDIR)/$(LIB).so.1
+	@ln -sf $(LIBDIR)/$(LIBNAME) $(LIBDIR)/$(LIB).so
+# ldconfig is glibc-specific; guard so Alpine/musl won't error
+	@command -v ldconfig >/dev/null 2>&1 && ldconfig || true
+	@rm -f $(LIB).*
 
 	@echo "[Install Headers]"
-	@if ( test ! -d $(PREFIX)/include ) ; then mkdir -p $(PREFIX)/include ; fi
-	@cp -f  Adafruit_*.h $(PREFIX)/include
-	@cp -f  ArduiPi_*.h $(PREFIX)/include
-	@cp -f  bcm2835.h $(PREFIX)/include
-	
-	
-# Uninstall the library 
-uninstall: 
-	@echo "[Uninstall Library]"
-	@rm -f ${LIBDIR}/${LIB}.*
+	@mkdir -p $(PREFIX)/include
+	@cp -f Adafruit_*.h $(PREFIX)/include
+	@cp -f ArduiPi_*.h $(PREFIX)/include
+	@cp -f bcm2835.h    $(PREFIX)/include
 
+# --- Uninstall / Clean ----------------------------------------------
+uninstall:
+	@echo "[Uninstall Library]"
+	@rm -f $(LIBDIR)/$(LIB).so $(LIBDIR)/$(LIB).so.1 $(LIBDIR)/$(LIBNAME)
 	@echo "[Uninstall Headers]"
-	@rm -rf  $(PREFIX)/include/ArduiPi_OLED*
-	@rm -rf  $(PREFIX)/include/bcm2835.h
-	
-# clear build files
+	@rm -f $(PREFIX)/include/ArduiPi_OLED* $(PREFIX)/include/bcm2835.h
+
 clean:
-	rm -rf *.o ${LIB}.* ${LIBDIR}/${LIB}.*
+	rm -f *.o $(LIB).* $(LIBDIR)/$(LIB).*
+
 
 
