@@ -8,6 +8,8 @@ This library replace the previous one named [ArduiPi_SSD1306][1]
 
 This has been ported to work with the ArduiPi Project but it can work on almost any Raspberry PI.
 
+* Patched out C99 compiler issues
+* Added Support for Alpine Linux / MUSL
 
 Installation
 ============
