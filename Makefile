@@ -81,9 +81,16 @@ else
     I2C_CFLAGS  :=
     I2C_LDFLAGS := -li2c
   else
-    $(warning No I2C library found - SMBus functions may not be available)
-    I2C_CFLAGS  :=
-    I2C_LDFLAGS :=
+    # On Alpine/musl, always try -li2c even if we can't detect the lib file
+    ifeq ($(IS_ALPINE),yes)
+      $(info Alpine detected: forcing I2C linking with -li2c)
+      I2C_CFLAGS  :=
+      I2C_LDFLAGS := -li2c
+    else
+      $(warning No I2C library found - SMBus functions may not be available)
+      I2C_CFLAGS  :=
+      I2C_LDFLAGS :=
+    endif
   endif
 endif
 
