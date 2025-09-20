@@ -96,7 +96,13 @@ endif
 
 # Final flags
 CFLAGS  := $(CCFLAGS) $(I2C_CFLAGS)
+# Always append I2C flags, and preserve any externally passed LDFLAGS
 LDFLAGS := $(LDFLAGS) $(I2C_LDFLAGS)
+
+# On Alpine, force I2C linking regardless of detection
+ifeq ($(IS_ALPINE),yes)
+  LDFLAGS := $(LDFLAGS) -li2c
+endif
 
 # If using musl and installing to a non-standard loader path, inject rpath automatically
 # But skip rpath if this is a temporary build directory (contains 'src' or 'tmp')
@@ -116,7 +122,8 @@ all: ArduiPi_OLED install
 
 # Shared library link
 ArduiPi_OLED: ArduiPi_OLED.o Adafruit_GFX.o bcm2835.o Wrapper.o
-	$(CXX) -shared -Wl,-soname,$(LIB).so.1 $(CFLAGS) $(LDFLAGS) -o $(LIBNAME) $^
+	@echo "Linking with LDFLAGS: $(LDFLAGS)"
+	$(CXX) -shared -Wl,-soname,$(LIB).so.1 $(CFLAGS) -o $(LIBNAME) $^ $(LDFLAGS) -li2c
 
 # Objects (use -fno-rtti to avoid link issues some setups have)
 ArduiPi_OLED.o: ArduiPi_OLED.cpp
