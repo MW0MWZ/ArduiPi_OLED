@@ -92,9 +92,14 @@ CFLAGS  := $(CCFLAGS) $(I2C_CFLAGS)
 LDFLAGS := $(LDFLAGS) $(I2C_LDFLAGS)
 
 # If using musl and installing to a non-standard loader path, inject rpath automatically
+# But skip rpath if this is a temporary build directory (contains 'src' or 'tmp')
 ifeq ($(IS_MUSL),yes)
   ifneq ($(PREFIX),/usr)
-    LDFLAGS += -Wl,-rpath,$(LIBDIR)
+    ifeq ($(findstring src,$(PREFIX)),)
+      ifeq ($(findstring tmp,$(PREFIX)),)
+        LDFLAGS += -Wl,-rpath,$(LIBDIR)
+      endif
+    endif
   endif
 endif
 
