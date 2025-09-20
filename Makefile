@@ -1,4 +1,3 @@
-
 #*********************************************************************
 # This is the makefile for the ArduiPi OLED library driver
 #
@@ -76,8 +75,16 @@ ifeq ($(HAVE_I2C_PC),yes)
   I2C_CFLAGS  := $(shell $(PKGCONFIG) --cflags i2c)
   I2C_LDFLAGS := $(shell $(PKGCONFIG) --libs   i2c)
 else
-  I2C_CFLAGS  :=
-  I2C_LDFLAGS := -li2c
+  # Fallback: check if libi2c.so exists in standard locations
+  HAVE_I2C_LIB := $(shell [ -f /usr/lib/libi2c.so ] || [ -f /usr/local/lib/libi2c.so ] || [ -f /lib/libi2c.so ] && echo yes || echo no)
+  ifeq ($(HAVE_I2C_LIB),yes)
+    I2C_CFLAGS  :=
+    I2C_LDFLAGS := -li2c
+  else
+    $(warning No I2C library found - SMBus functions may not be available)
+    I2C_CFLAGS  :=
+    I2C_LDFLAGS :=
+  endif
 endif
 
 # Final flags
@@ -138,6 +145,3 @@ uninstall:
 
 clean:
 	rm -f *.o $(LIB).* $(LIBDIR)/$(LIB).*
-
-
-
