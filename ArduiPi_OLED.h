@@ -164,6 +164,7 @@ class ArduiPi_OLED : public Adafruit_GFX
   void sendCommand(uint8_t c);
   void sendCommand(uint8_t c0, uint8_t c1);
   void sendCommand(uint8_t c0, uint8_t c1, uint8_t c2);
+  void sendCommands(const uint8_t *c, uint8_t len);
   void sendData(uint8_t c);
 
   void clearDisplay(void);
@@ -199,6 +200,27 @@ class ArduiPi_OLED : public Adafruit_GFX
   uint8_t oled_type;
   uint8_t grayH, grayL;
   
+  // Hardware scrolling: what the controller can do, and the scroll that
+  // is running (replayed around each display(), as the SSD1306 must not
+  // have its RAM written while it scrolls)
+  boolean isSSD1306Family(void);
+  boolean hasHWScroll(void);
+  boolean hasDiagScroll(void);
+  boolean ch1116; // a type 6 panel whose controller is a CH1116 (see begin())
+  uint8_t scrollPage(uint8_t page);
+  void sendScroll(void);
+  // A scroll's setup: up to 4 commands, each sent in a transaction of its
+  // own (scroll_cmdlen: each one's length in scroll_seq)
+  uint8_t scroll_seq[24];
+  uint8_t scroll_len;
+  uint8_t scroll_cmdlen[4];
+  uint8_t scroll_ncmd;
+  void scrollClear(void);
+  void scrollAdd(const uint8_t *c, uint8_t len);
+  void startHorizontal(uint8_t cmd, uint8_t start, uint8_t stop);
+  void startDiagonal(uint8_t cmd, uint8_t start, uint8_t stop);
+  boolean scrolling;
+
   inline boolean isI2C(void);
   inline boolean isSPI(void);
   void fastSPIwrite(uint8_t c);

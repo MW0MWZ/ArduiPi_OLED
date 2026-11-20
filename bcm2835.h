@@ -1132,6 +1132,10 @@ extern "C" {
 		/// \return i2c smbus command return code
     extern int bcm2835_i2c_write(const char * buf, uint32_t len);
 
+    /// Reads an OLED controller's status byte (control byte 00h, then one
+    /// byte read). Returns -1 on error.
+    extern int bcm2835_i2c_read_status(void);
+
     /// Transfers any number of bytes from the currently selected I2C slave.
     /// (as previously set by \sa bcm2835_i2c_setSlaveAddress)
     /// \param[in] buf Buffer of bytes to receive.

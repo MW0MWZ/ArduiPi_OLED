@@ -30,6 +30,26 @@ All text above, and the splash screen below must be included in any redistributi
 
 02/24/2015  Charles-Henri Hallard 
             added support for 1.3" I2C OLED with SH1106 driver
+
+11/20/2026  Andy Taylor (MW0MWZ)
+            display() sets the SSD1306 write window for every frame, so
+            a byte lost on the bus no longer shifts every frame after it.
+            Hardware scrolling follows the SSD1306 datasheet: stopped for
+            each frame (no RAM writes while it scrolls) and before its
+            settings change, pages clamped to the display's own, dummy
+            byte 00h; none started on the SH1106 and SSD1327, which have
+            no scroll commands, but stopscroll() still stops one on
+            every type. A type 6 panel whose controller is a CH1116 (its
+            status byte's ID, 010110) scrolls with the CH1116's own
+            command layout, over its 128 visible columns. On the
+            SSD1306 a horizontal scroll clears the vertical scroll area
+            a diagonal one left (A3h 00h 00h): it rolled the whole screen
+            up during calls, and clears the vertical offset it left
+            (a vertical-and-horizontal setup with offset 0). A scroll's
+            setup is sent in one I2C transaction per command: some
+            compatibles take a command only that way. The diagonal
+            scroll is set up for the SSD1315 too (its 7-byte layout,
+            horizontal scroll on), which the SSD1306 reads as its own.
             
 *********************************************************************/
 
@@ -236,6 +256,12 @@ ArduiPi_OLED::ArduiPi_OLED()
   rst = 0 ;
   dc  = 0 ;
   cs =  0 ;
+
+  // No hardware scroll running
+  scrolling   = false;
+  scroll_len  = 0;
+  scroll_ncmd = 0;
+  ch1116     = false;
   
   // Lcd size
   oled_width  = 0;
@@ -588,6 +614,17 @@ void ArduiPi_OLED::begin( void )
 
   sendCommand(SSD_Set_ContrastLevel, contrast);
 
+  // Boards sold as SH1106 may carry a CH1116, which also scrolls in
+  // hardware, with its own command layout. Its status byte names it: the
+  // low six bits are its ID, 010110 (CH1116 datasheet, Read Status); a
+  // genuine SH1106 has no ID bits there.
+  ch1116 = false;
+  if (oled_type == OLED_SH1106_I2C_128x64 && isI2C())
+  {
+    int status = bcm2835_i2c_read_status();
+    ch1116 = status >= 0 && (status & 0x3F) == 0x16;
+  }
+
   stopscroll();
   
   // Empty uninitialized buffer
@@ -692,6 +729,27 @@ void ArduiPi_OLED::sendCommand(uint8_t c)
   }
 }
 
+// sendCommands sends a command with its parameters (or several) in one
+// transfer: on I2C one transaction, control byte 00h then the bytes.
+void ArduiPi_OLED::sendCommands(const uint8_t *c, uint8_t len)
+{
+  if (isSPI())
+  {
+    bcm2835_gpio_write(dc, LOW);
+    for (uint8_t i = 0; i < len; i++)
+      fastSPIwrite(c[i]);
+  }
+  else
+  {
+    char buff[33];
+    if (len > 32)
+      len = 32;
+    buff[0] = SSD_Command_Mode;
+    memcpy(&buff[1], c, len);
+    fastI2Cwrite(buff, len + 1);
+  }
+}
+
 void ArduiPi_OLED::sendCommand(uint8_t c0, uint8_t c1) 
 { 
   char buff[3] ;
@@ -747,77 +805,194 @@ void ArduiPi_OLED::sendCommand(uint8_t c0, uint8_t c1, uint8_t c2)
 }
 
 
-// startscrollright
-// Activate a right handed scroll for rows start through stop
-// Hint, the display is 16 rows tall. To scroll the whole display, run:
-// display.scrollright(0x00, 0x0F) 
+// Hardware scrolling.
+//
+// The SSD1306 family scrolls in hardware, and so does the CH1116, found
+// on boards sold as SH1106 (see begin()), with its own command layout. The SH1106 has no scroll commands: sent to it, a scroll's
+// bytes are read as other commands, so on it (and on the SSD1327 96x96)
+// no scroll is started. But some boards sold as SH1106 carry a clone
+// controller (CH1116 and the like) that reads back its RAM as the SH1106
+// does and also has the SSD1306's hardware scroll: a scroll started there
+// keeps running through restarts until power is cut. So stopscroll()
+// always sends "deactivate scroll" (0x2E), on every type, as this library
+// always did: a genuine SH1106 ignores it.
+//
+// The SSD1306 datasheet forbids writing its RAM, or changing the scroll
+// settings, while a scroll is running, and says the RAM must be rewritten
+// after a scroll stops (a horizontal scroll moves the RAM contents). So a
+// scroll is stopped before its settings change, and display() stops the
+// running scroll, writes the frame, and starts it again.
+//
+// Pages are 8 rows: 0-7 on a 64-row display, 0-3 on a 32-row one. Callers
+// pass 0x0F for "to the bottom" (written for a 16-page display): pages are
+// clamped to the display's own.
+
+boolean ArduiPi_OLED::isSSD1306Family(void)
+{
+  return oled_type == OLED_ADAFRUIT_SPI_128x32 || oled_type == OLED_ADAFRUIT_SPI_128x64 ||
+         oled_type == OLED_ADAFRUIT_I2C_128x32 || oled_type == OLED_ADAFRUIT_I2C_128x64 ||
+         oled_type == OLED_SEEED_I2C_128x64;
+}
+
+boolean ArduiPi_OLED::hasHWScroll(void)
+{
+  return isSSD1306Family() || ch1116;
+}
+
+// The vertical and horizontal (diagonal) scroll is the SSD1306's own; the
+// SSD1308 (Seeed 128x64) and the CH1116 scroll only horizontally.
+boolean ArduiPi_OLED::hasDiagScroll(void)
+{
+  return isSSD1306Family() && oled_type != OLED_SEEED_I2C_128x64;
+}
+
+uint8_t ArduiPi_OLED::scrollPage(uint8_t page)
+{
+  uint8_t last = (oled_height / 8) - 1;
+  return page > last ? last : page;
+}
+
+void ArduiPi_OLED::scrollClear(void)
+{
+  scroll_len  = 0;
+  scroll_ncmd = 0;
+}
+
+void ArduiPi_OLED::scrollAdd(const uint8_t *c, uint8_t len)
+{
+  if (scroll_ncmd >= sizeof(scroll_cmdlen) || scroll_len + len > sizeof(scroll_seq))
+    return;
+  memcpy(scroll_seq + scroll_len, c, len);
+  scroll_len += len;
+  scroll_cmdlen[scroll_ncmd++] = len;
+}
+
+// A scroll's setup is sent a command at a time, each command with its
+// parameters in one I2C transaction of its own, then the activation.
+// Some SSD1306-compatible controllers take a command only that way: sent
+// byte by byte (one transaction per byte), or run together with the next
+// command in one transaction, its parameters were lost.
+void ArduiPi_OLED::sendScroll(void)
+{
+  uint8_t off = 0;
+  for (uint8_t i = 0; i < scroll_ncmd; i++)
+  {
+    sendCommands(scroll_seq + off, scroll_cmdlen[i]);
+    off += scroll_cmdlen[i];
+  }
+  sendCommand(SSD_Activate_Scroll);
+}
+
+// A horizontal scroll of pages start through stop (cmd: 26h right, 27h
+// left).
+//
+// The CH1116 (datasheet, 24h and 26h/27h): the window of columns that
+// scroll, set to the 128 visible ones of its 132 (2-129), as the 4
+// off-screen columns hold whatever was there at power-up and would sweep
+// across the panel at the end of each pass; then start page, time
+// interval (00h: 6 frames, near the SSD1306's 5) and end page, with no
+// dummy bytes. Writing its RAM while it scrolls is allowed.
+//
+// The SSD1306: a diagonal scroll (the standby screen's) leaves its
+// vertical offset and vertical scroll area set, and the panel then rolls
+// the whole screen up during a later horizontal scroll. So the offset is
+// cleared (a vertical-and-horizontal setup with offset 0, not started)
+// and the area set to no rows (A3h 00h 00h), before the horizontal setup:
+// dummy, start page, interval (5 frames), end page, dummy 00h, FFh.
+void ArduiPi_OLED::startHorizontal(uint8_t cmd, uint8_t start, uint8_t stop)
+{
+  if (!hasHWScroll())
+    return;
+  stopscroll();
+  start = scrollPage(start);
+  stop  = scrollPage(stop);
+  if (stop < start)
+    stop = start;
+  scrollClear();
+  if (ch1116)
+  {
+    const uint8_t window[] = { 0x24, 0x02, 0x81 };
+    const uint8_t setup[]  = { cmd, start, 0x00, stop };
+    scrollAdd(window, sizeof(window));
+    scrollAdd(setup, sizeof(setup));
+  }
+  else
+  {
+    if (hasDiagScroll()) // the vertical scroll: SSD1306 only (not the SSD1308)
+    {
+      const uint8_t offset[] = { SSD1306_VERTICAL_AND_RIGHT_HORIZONTAL_SCROLL, 0x00, 0x00, 0x00, 0x00, 0x00 };
+      const uint8_t area[]   = { SSD1306_SET_VERTICAL_SCROLL_AREA, 0x00, 0x00 };
+      scrollAdd(offset, sizeof(offset));
+      scrollAdd(area, sizeof(area));
+    }
+    const uint8_t setup[] = { cmd, 0x00, start, 0x00, stop, 0x00, 0xFF };
+    scrollAdd(setup, sizeof(setup));
+  }
+  sendScroll();
+  scrolling = true;
+}
+
+// A diagonal scroll (SSD1306 family; cmd: 29h right, 2Ah left): the
+// vertical scroll area, no fixed rows and all rows scrolling; then the
+// setup. The classic SSD1306 takes dummy, start page, interval, end page,
+// vertical offset. The SSD1315 takes 7 bytes: A[0] horizontal scroll on
+// (1) or off (0), start page, interval, end page, vertical offset, start
+// column, end column (SSD1315 datasheet; it drops the command when they
+// are not all there, and with A=0 rolls the screen vertically only). So:
+// A=01h (a dummy on the SSD1306), and start column 00h, end column FFh
+// (the SSD1315 takes 7 bits, 127; on the SSD1306, set column 0 and not a
+// command). The CH1116 has none: it scrolls the same pages across.
+void ArduiPi_OLED::startDiagonal(uint8_t cmd, uint8_t start, uint8_t stop)
+{
+  if (ch1116)
+  {
+    startHorizontal(cmd == SSD1306_VERTICAL_AND_RIGHT_HORIZONTAL_SCROLL ? SSD_Right_Horizontal_Scroll : SSD_Left_Horizontal_Scroll, start, stop);
+    return;
+  }
+  if (!hasDiagScroll())
+    return;
+  stopscroll();
+  start = scrollPage(start);
+  stop  = scrollPage(stop);
+  if (stop < start)
+    stop = start;
+  scrollClear();
+  const uint8_t area[]  = { SSD1306_SET_VERTICAL_SCROLL_AREA, 0x00, (uint8_t)oled_height };
+  const uint8_t setup[] = { cmd, 0x01, start, 0x00, stop, 0x01, 0x00, 0xFF };
+  scrollAdd(area, sizeof(area));
+  scrollAdd(setup, sizeof(setup));
+  sendScroll();
+  scrolling = true;
+}
+
 void ArduiPi_OLED::startscrollright(uint8_t start, uint8_t stop)
 {
-  sendCommand(SSD_Right_Horizontal_Scroll);
-  sendCommand(0X00);
-  sendCommand(start);
-  sendCommand(0X00);
-  sendCommand(stop);
-  sendCommand(0X01);
-  sendCommand(0XFF);
-  sendCommand(SSD_Activate_Scroll);
+  startHorizontal(SSD_Right_Horizontal_Scroll, start, stop);
 }
 
-// startscrollleft
-// Activate a right handed scroll for rows start through stop
-// Hint, the display is 16 rows tall. To scroll the whole display, run:
-// display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrollleft(uint8_t start, uint8_t stop)
 {
-  sendCommand(SSD_Left_Horizontal_Scroll);
-  sendCommand(0X00);
-  sendCommand(start);
-  sendCommand(0X00);
-  sendCommand(stop);
-  sendCommand(0X01);
-  sendCommand(0XFF);
-  sendCommand(SSD_Activate_Scroll);
+  startHorizontal(SSD_Left_Horizontal_Scroll, start, stop);
 }
 
-// startscrolldiagright
-// Activate a diagonal scroll for rows start through stop
-// Hint, the display is 16 rows tall. To scroll the whole display, run:
-// display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrolldiagright(uint8_t start, uint8_t stop)
 {
-  sendCommand(SSD1306_SET_VERTICAL_SCROLL_AREA);  
-  sendCommand(0X00);
-  sendCommand(oled_height);
-  sendCommand(SSD1306_VERTICAL_AND_RIGHT_HORIZONTAL_SCROLL);
-  sendCommand(0X00);
-  sendCommand(start);
-  sendCommand(0X00);
-  sendCommand(stop);
-  sendCommand(0X01);
-  sendCommand(SSD_Activate_Scroll);
+  startDiagonal(SSD1306_VERTICAL_AND_RIGHT_HORIZONTAL_SCROLL, start, stop);
 }
 
-// startscrolldiagleft
-// Activate a diagonal scroll for rows start through stop
-// Hint, the display is 16 rows tall. To scroll the whole display, run:
-// display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrolldiagleft(uint8_t start, uint8_t stop)
 {
-  sendCommand(SSD1306_SET_VERTICAL_SCROLL_AREA);  
-  sendCommand(0X00);
-  sendCommand(oled_height);
-  sendCommand(SSD1306_VERTICAL_AND_LEFT_HORIZONTAL_SCROLL);
-  sendCommand(0X00);
-  sendCommand(start);
-  sendCommand(0X00);
-  sendCommand(stop);
-  sendCommand(0X01);
-  sendCommand(SSD_Activate_Scroll);
+  startDiagonal(SSD1306_VERTICAL_AND_LEFT_HORIZONTAL_SCROLL, start, stop);
 }
 
 
 void ArduiPi_OLED::setHorizontalScrollProperties(bool direction,uint8_t startRow, uint8_t endRow,uint8_t startColumn, uint8_t endColumn, uint8_t scrollSpeed)
 {
+  // SSD1306 layout only
+  if (!isSSD1306Family())
+    return;
+  // Settings must not change while a scroll runs
+  stopscroll();
   if(Scroll_Right == direction)
   {
       //Scroll Right
@@ -829,9 +1004,9 @@ void ArduiPi_OLED::setHorizontalScrollProperties(bool direction,uint8_t startRow
       sendCommand(SSD_Right_Horizontal_Scroll);
   }
   sendCommand(0x00);       //Dummmy byte
-  sendCommand(startRow);
+  sendCommand(scrollPage(startRow));
   sendCommand(scrollSpeed);
-  sendCommand(endRow);
+  sendCommand(scrollPage(endRow));
   sendCommand(startColumn+8);
   sendCommand(endColumn+8);
   sendCommand(0x00);      //Dummmy byte
@@ -840,6 +1015,8 @@ void ArduiPi_OLED::setHorizontalScrollProperties(bool direction,uint8_t startRow
 
 void ArduiPi_OLED::stopscroll(void)
 {
+  // On every type: see above (SH1106 clones scroll too)
+  scrolling = false;
   sendCommand(SSD_Deactivate_Scroll);
 }
 
@@ -882,6 +1059,24 @@ void ArduiPi_OLED::display(void)
     sendCommand(SSD1306_Set_Lower_Column_Start_Address  | 0x0); // low col = 0
     sendCommand(SSD1306_Set_Higher_Column_Start_Address | 0x0); // hi col = 0
     sendCommand(SSD1306_Set_Start_Line  | 0x0); // line #0
+  }
+
+  // No RAM writes while the SSD1306 scrolls: stop it for the frame, and
+  // start it again after (the frame then rewrites the RAM the scroll moved)
+  // (The CH1116 allows RAM writes while it scrolls: its scroll keeps going)
+  boolean resume = scrolling && !ch1116;
+  if (resume)
+    sendCommand(SSD_Deactivate_Scroll);
+
+  // The SSD1306 family runs in horizontal addressing mode (begin()), where
+  // the column commands above do nothing: without its window set again,
+  // a frame starts wherever the last one stopped, and a single byte lost
+  // on the bus shifts every frame after it, the picture creeping across
+  // the screen. Set the window (as begin() does) for every frame.
+  if (isSSD1306Family())
+  {
+    sendCommand(SSD_Set_Column_Address, 0, 127);
+    sendCommand(SSD_Set_Page_Address, 0, 7);
   }
 
   uint16_t i=0 ;
@@ -950,6 +1145,9 @@ void ArduiPi_OLED::display(void)
       }
     }
   }
+
+  if (resume)
+    sendScroll();
 }
 
 // clear everything (in the buffer)

@@ -891,6 +891,15 @@ int bcm2835_i2c_write(const char * buf, uint32_t len)
 
 }
 
+// Reads the controller's status byte: control byte 00h (command), then
+// one byte read back (SH1106 / CH1116 "Read Status"). Returns -1 on error.
+int bcm2835_i2c_read_status(void)
+{
+	if (!i2c_fd)
+		return -1;
+	return i2c_smbus_read_byte_data(i2c_fd, 0x00);
+}
+
 // Read an number of bytes from I2C
 // to do
 uint8_t bcm2835_i2c_read(char* buf, uint32_t len)
