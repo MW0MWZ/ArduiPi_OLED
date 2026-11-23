@@ -30,6 +30,7 @@ All text above, and the splash screen must be included in any redistribution
 #define _ArduiPi_OLED_H
 
 #include "./Adafruit_GFX.h"
+#include <pthread.h>
 
 #define BLACK 0
 #define WHITE 1
@@ -220,6 +221,28 @@ class ArduiPi_OLED : public Adafruit_GFX
   void startHorizontal(uint8_t cmd, uint8_t start, uint8_t stop);
   void startDiagonal(uint8_t cmd, uint8_t start, uint8_t stop);
   boolean scrolling;
+
+  // What a panel cannot scroll in hardware, the library moves itself, a
+  // step at a time from a thread of its own (see startRoll()): the
+  // vertical part of a diagonal scroll (roll_v: the display start line,
+  // roll_line), and on a panel with no scroll commands the horizontal
+  // part too (roll_h: pages roll_start-roll_stop drawn roll_off columns
+  // round, roll_dir +1 left or -1 right).
+  boolean canRoll(void);
+  void startRoll(boolean vertical, boolean horizontal, int8_t dir, uint8_t start, uint8_t stop);
+  void stopRoll(void);
+  void rollStep(void);
+  void writePage(uint8_t page);
+  static void *rollThread(void *arg);
+  pthread_t roll_thread;
+  pthread_mutex_t bus;       // the panel's bus: the roll and frames do not interleave
+  pthread_mutex_t roll_lock; // roll_run, with roll_wake
+  pthread_cond_t  roll_wake;
+  boolean roll_running;      // the thread exists (to be joined)
+  boolean roll_run;          // the thread is to keep going
+  boolean roll_v, roll_h;
+  uint8_t roll_line, roll_off, roll_start, roll_stop;
+  int8_t  roll_dir;
 
   inline boolean isI2C(void);
   inline boolean isSPI(void);

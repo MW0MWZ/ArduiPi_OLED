@@ -95,9 +95,10 @@ else
 endif
 
 # Final flags
-CFLAGS  := $(CCFLAGS) $(I2C_CFLAGS)
+# -pthread: the library scrolls some panels from a thread of its own
+CFLAGS  := $(CCFLAGS) $(I2C_CFLAGS) -pthread
 # Always append I2C flags, and preserve any externally passed LDFLAGS
-LDFLAGS := $(LDFLAGS) $(I2C_LDFLAGS)
+LDFLAGS := $(LDFLAGS) $(I2C_LDFLAGS) -pthread
 
 # On Alpine, force I2C linking regardless of detection
 ifeq ($(IS_ALPINE),yes)

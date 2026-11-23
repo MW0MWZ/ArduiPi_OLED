@@ -50,12 +50,25 @@ All text above, and the splash screen below must be included in any redistributi
             compatibles take a command only that way. The diagonal
             scroll is set up for the SSD1315 too (its 7-byte layout,
             horizontal scroll on), which the SSD1306 reads as its own.
+
+11/23/2026  Andy Taylor (MW0MWZ)
+            What a panel cannot scroll in hardware the library moves
+            itself, from a thread of its own, a step every 50 ms: the
+            vertical half of a diagonal scroll on the CH1116 and the
+            SSD1308 (which scroll only across), by stepping the display
+            start line (40h-7Fh: the screen rolls up, wrapping, with no
+            redraw); on a genuine SH1106 (no scroll commands) the
+            horizontal scroll too, the scrolling pages redrawn a column
+            round each step. stopscroll() ends it and puts the top row
+            and the columns back. A mutex keeps the steps and frames
+            apart on the bus. Link with -pthread.
             
 *********************************************************************/
 
 #include "./ArduiPi_OLED_lib.h" 
 #include "./Adafruit_GFX.h"
 #include "./ArduiPi_OLED.h"
+#include <time.h>
 
   // 8x8 Font ASCII 32 - 127 Implemented
 // Users can modify this to support more characters(glyphs)
@@ -262,6 +275,24 @@ ArduiPi_OLED::ArduiPi_OLED()
   scroll_len  = 0;
   scroll_ncmd = 0;
   ch1116     = false;
+
+  // No software roll
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&bus, &attr);
+  pthread_mutexattr_destroy(&attr);
+  pthread_mutex_init(&roll_lock, NULL);
+  pthread_cond_init(&roll_wake, NULL);
+  roll_running = false;
+  roll_run     = false;
+  roll_v       = false;
+  roll_h       = false;
+  roll_line    = 0;
+  roll_off     = 0;
+  roll_start   = 0;
+  roll_stop    = 0;
+  roll_dir     = 1;
   
   // Lcd size
   oled_width  = 0;
@@ -428,6 +459,9 @@ boolean ArduiPi_OLED::init(int8_t RST, uint8_t OLED_TYPE)
 
 void ArduiPi_OLED::close(void) 
 {
+  // The roll draws from the buffer freed here
+  stopRoll();
+
   // De-Allocate memory for OLED buffer if any
   if (poledbuff)
     free(poledbuff);
@@ -902,12 +936,19 @@ void ArduiPi_OLED::sendScroll(void)
 void ArduiPi_OLED::startHorizontal(uint8_t cmd, uint8_t start, uint8_t stop)
 {
   if (!hasHWScroll())
+  {
+    // No scroll commands (a genuine SH1106): the pages roll in software
+    stopscroll();
+    if (canRoll())
+      startRoll(false, true, cmd == SSD_Left_Horizontal_Scroll ? 1 : -1, scrollPage(start), scrollPage(stop));
     return;
+  }
   stopscroll();
   start = scrollPage(start);
   stop  = scrollPage(stop);
   if (stop < start)
     stop = start;
+  pthread_mutex_lock(&bus);
   scrollClear();
   if (ch1116)
   {
@@ -930,6 +971,7 @@ void ArduiPi_OLED::startHorizontal(uint8_t cmd, uint8_t start, uint8_t stop)
   }
   sendScroll();
   scrolling = true;
+  pthread_mutex_unlock(&bus);
 }
 
 // A diagonal scroll (SSD1306 family; cmd: 29h right, 2Ah left): the
@@ -944,18 +986,32 @@ void ArduiPi_OLED::startHorizontal(uint8_t cmd, uint8_t start, uint8_t stop)
 // command). The CH1116 has none: it scrolls the same pages across.
 void ArduiPi_OLED::startDiagonal(uint8_t cmd, uint8_t start, uint8_t stop)
 {
-  if (ch1116)
+  if (!hasDiagScroll())
   {
-    startHorizontal(cmd == SSD1306_VERTICAL_AND_RIGHT_HORIZONTAL_SCROLL ? SSD_Right_Horizontal_Scroll : SSD_Left_Horizontal_Scroll, start, stop);
+    // The CH1116 and the SSD1308 scroll across in hardware, and the
+    // library rolls the screen up; a panel with no scroll commands (a
+    // genuine SH1106) has both done in software
+    boolean left = cmd == SSD1306_VERTICAL_AND_LEFT_HORIZONTAL_SCROLL;
+    if (hasHWScroll())
+    {
+      startHorizontal(left ? SSD_Left_Horizontal_Scroll : SSD_Right_Horizontal_Scroll, start, stop);
+      if (canRoll())
+        startRoll(true, false, 0, 0, 0);
+    }
+    else
+    {
+      stopscroll();
+      if (canRoll())
+        startRoll(true, true, left ? 1 : -1, scrollPage(start), scrollPage(stop));
+    }
     return;
   }
-  if (!hasDiagScroll())
-    return;
   stopscroll();
   start = scrollPage(start);
   stop  = scrollPage(stop);
   if (stop < start)
     stop = start;
+  pthread_mutex_lock(&bus);
   scrollClear();
   const uint8_t area[]  = { SSD1306_SET_VERTICAL_SCROLL_AREA, 0x00, (uint8_t)oled_height };
   const uint8_t setup[] = { cmd, 0x01, start, 0x00, stop, 0x01, 0x00, 0xFF };
@@ -963,6 +1019,115 @@ void ArduiPi_OLED::startDiagonal(uint8_t cmd, uint8_t start, uint8_t stop)
   scrollAdd(setup, sizeof(setup));
   sendScroll();
   scrolling = true;
+  pthread_mutex_unlock(&bus);
+}
+
+// Software roll.
+//
+// Panels the library can roll: the SSD1306 family and the SH1106 (and
+// CH1116), whose display start line command (40h-7Fh) sets which RAM row
+// shows at the top, the rest following round. Stepping it moves the whole
+// screen up a row, wrapping, with one command byte and no redraw: the
+// vertical half of the SSD1306's diagonal scroll. A genuine SH1106 has no
+// scroll at all: there the pages also roll across, redrawn a column round
+// each step. A step every 50 ms is near the hardware's pace (a step every
+// 5 or 6 frames); the redraw of many pages on a slow bus slows it.
+boolean ArduiPi_OLED::canRoll(void)
+{
+  return poledbuff && (isSSD1306Family() || oled_type == OLED_SH1106_I2C_128x64);
+}
+
+void ArduiPi_OLED::startRoll(boolean vertical, boolean horizontal, int8_t dir, uint8_t start, uint8_t stop)
+{
+  stopRoll();
+  pthread_mutex_lock(&bus);
+  roll_v     = vertical;
+  roll_h     = horizontal;
+  roll_dir   = dir;
+  roll_start = start;
+  roll_stop  = stop < start ? start : stop;
+  pthread_mutex_unlock(&bus);
+  roll_run = true;
+  if (pthread_create(&roll_thread, NULL, rollThread, this) == 0)
+    roll_running = true;
+  else
+    roll_run = false;
+}
+
+// stopRoll ends the thread; the start line and the columns stay where
+// they are until stopscroll() puts them back.
+void ArduiPi_OLED::stopRoll(void)
+{
+  if (!roll_running)
+    return;
+  pthread_mutex_lock(&roll_lock);
+  roll_run = false;
+  pthread_cond_signal(&roll_wake);
+  pthread_mutex_unlock(&roll_lock);
+  pthread_join(roll_thread, NULL);
+  roll_running = false;
+}
+
+void *ArduiPi_OLED::rollThread(void *arg)
+{
+  ArduiPi_OLED *oled = (ArduiPi_OLED *)arg;
+  pthread_mutex_lock(&oled->roll_lock);
+  while (oled->roll_run)
+  {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 50000000L;
+    if (until.tv_nsec >= 1000000000L)
+    {
+      until.tv_sec++;
+      until.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(&oled->roll_wake, &oled->roll_lock, &until);
+    if (!oled->roll_run)
+      break;
+    pthread_mutex_unlock(&oled->roll_lock);
+    oled->rollStep();
+    pthread_mutex_lock(&oled->roll_lock);
+  }
+  pthread_mutex_unlock(&oled->roll_lock);
+  return NULL;
+}
+
+void ArduiPi_OLED::rollStep(void)
+{
+  pthread_mutex_lock(&bus);
+  if (roll_v)
+  {
+    roll_line = (roll_line + 1) % oled_height;
+    sendCommand(SSD1306_Set_Start_Line | roll_line);
+  }
+  if (roll_h)
+  {
+    roll_off = (roll_off + oled_width + roll_dir) % oled_width;
+    for (uint8_t page = roll_start; page <= roll_stop; page++)
+      writePage(page);
+  }
+  pthread_mutex_unlock(&bus);
+}
+
+// writePage writes one page of the buffer to an SH1106 (its 128 columns
+// at 2-129 of 132), rolled roll_off columns round while the page rolls.
+void ArduiPi_OLED::writePage(uint8_t page)
+{
+  char buff[17];
+  const uint8_t *row = poledbuff + page * oled_width;
+  uint8_t off = (roll_h && page >= roll_start && page <= roll_stop) ? roll_off : 0;
+
+  sendCommand(0xB0 + page);
+  sendCommand(0x02);
+  sendCommand(0x10);
+  buff[0] = SSD_Data_Mode;
+  for (uint8_t col = 0; col < oled_width; col += 16)
+  {
+    for (uint8_t x = 0; x < 16; x++)
+      buff[x + 1] = row[(col + x + off) % oled_width];
+    fastI2Cwrite(buff, 17);
+  }
 }
 
 void ArduiPi_OLED::startscrollright(uint8_t start, uint8_t stop)
@@ -1015,9 +1180,25 @@ void ArduiPi_OLED::setHorizontalScrollProperties(bool direction,uint8_t startRow
 
 void ArduiPi_OLED::stopscroll(void)
 {
+  stopRoll();
+  pthread_mutex_lock(&bus);
   // On every type: see above (SH1106 clones scroll too)
   scrolling = false;
   sendCommand(SSD_Deactivate_Scroll);
+  // A roll is put back: the top row first, the pages square
+  if (roll_line != 0)
+  {
+    roll_line = 0;
+    sendCommand(SSD1306_Set_Start_Line | 0x0);
+  }
+  boolean redraw = roll_h && roll_off != 0 && poledbuff;
+  roll_off = 0;
+  if (redraw)
+    for (uint8_t page = roll_start; page <= roll_stop; page++)
+      writePage(page);
+  roll_v = false;
+  roll_h = false;
+  pthread_mutex_unlock(&bus);
 }
 
 void ArduiPi_OLED::sendData(uint8_t c) 
@@ -1048,6 +1229,7 @@ void ArduiPi_OLED::sendData(uint8_t c)
 
 void ArduiPi_OLED::display(void) 
 {
+  pthread_mutex_lock(&bus);
 
   if (oled_type == OLED_SEEED_I2C_96x96 )
   {
@@ -1058,7 +1240,7 @@ void ArduiPi_OLED::display(void)
   {
     sendCommand(SSD1306_Set_Lower_Column_Start_Address  | 0x0); // low col = 0
     sendCommand(SSD1306_Set_Higher_Column_Start_Address | 0x0); // hi col = 0
-    sendCommand(SSD1306_Set_Start_Line  | 0x0); // line #0
+    sendCommand(SSD1306_Set_Start_Line  | roll_line); // line #0, or where a roll is
   }
 
   // No RAM writes while the SSD1306 scrolls: stop it for the frame, and
@@ -1118,19 +1300,7 @@ void ArduiPi_OLED::display(void)
     if (oled_type == OLED_SH1106_I2C_128x64)
     {
       for (uint8_t k=0; k<8; k++) 
-      {
-        sendCommand(0xB0+k);//set page addressSSD_Data_Mode;
-        sendCommand(0x02) ;//set lower column address
-        sendCommand(0x10) ;//set higher column address
-
-       for( i=0; i<8; i++)
-       {
-          for (x=1; x<=16; x++) 
-            buff[x] = *p++;
-
-          fastI2Cwrite(buff, 17);
-        }
-      }
+        writePage(k);
     }
     else
     {
@@ -1148,6 +1318,7 @@ void ArduiPi_OLED::display(void)
 
   if (resume)
     sendScroll();
+  pthread_mutex_unlock(&bus);
 }
 
 // clear everything (in the buffer)
