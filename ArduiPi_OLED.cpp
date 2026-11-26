@@ -697,9 +697,9 @@ void ArduiPi_OLED::putSeedChar(char C)
         C=' '; //Space
     } 
 
-    for(char i=0;i<8;i=i+2)
+    for(int i=0;i<8;i=i+2)
     {
-        for(char j=0;j<8;j++)
+        for(int j=0;j<8;j++)
         {
             // Character is constructed two pixel at a time using vertical mode from the default 8x8 font
             char c=0x00;

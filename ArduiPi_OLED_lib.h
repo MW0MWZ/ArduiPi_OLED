@@ -55,7 +55,9 @@
 #define OLED_LAST_OLED            7 /* always last type, used in code to end array */
 
 
-static const char * oled_type_str[] = {
+// Names of the OLED types, for programs that list them (the examples);
+// unused by the library itself
+static const char * oled_type_str[] __attribute__((unused)) = {
     "Adafruit SPI 128x32",
     "Adafruit SPI 128x64",
     "Adafruit I2C 128x32",
